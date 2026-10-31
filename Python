@@ -1,0 +1,372 @@
+
+#!/usr/bin/env python3
+# SENTINEL - Ethical Pentesting Toolkit
+# For systems you own or have permission to test.
+
+import socket
+import ssl
+import ipaddress
+import urllib.request
+import urllib.error
+import json
+import os
+import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "1.0"
+TIMEOUT = 1.5
+
+PORTS = {
+    21: "FTP",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    80: "HTTP",
+    110: "POP3",
+    143: "IMAP",
+    443: "HTTPS",
+    445: "SMB",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    8080: "HTTP-Proxy",
+    8443: "HTTPS-Alt"
+}
+
+REPORT_DIR = "reports"
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+
+def banner():
+    os.system("clear")
+    print("""
+========================================
+       SENTINEL SECURITY TOOLKIT
+             Version 1.0
+========================================
+   Ethical Network Security Scanner
+========================================
+""")
+
+
+def authorize(target):
+    print("\n[!] Authorized testing only.")
+    print("[!] Target:", target)
+
+    confirmation = input(
+        "Do you own this target or have permission? (yes/no): "
+    ).strip().lower()
+
+    if confirmation != "yes":
+        print("[-] Authorization not confirmed.")
+        return False
+
+    return True
+
+
+def resolve_host(host):
+    try:
+        return socket.gethostbyname(host)
+    except socket.gaierror:
+        print("[-] Could not resolve hostname.")
+        return None
+
+
+def port_scan(ip):
+    print(f"\n[+] Scanning common TCP ports on {ip}\n")
+
+    results = []
+
+    def check_port(port):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(TIMEOUT)
+                result = s.connect_ex((ip, port))
+
+                if result == 0:
+                    return {
+                        "port": port,
+                        "service": PORTS.get(port, "Unknown"),
+                        "status": "OPEN"
+                    }
+        except OSError:
+            pass
+
+        return None
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for result in executor.map(check_port, PORTS.keys()):
+            if result:
+                results.append(result)
+                print(
+                    f"[OPEN] {result['port']}/tcp "
+                    f"- {result['service']}"
+                )
+
+    if not results:
+        print("[-] No open common ports detected.")
+
+    return results
+
+
+def network_scan(network):
+    try:
+        subnet = ipaddress.ip_network(network, strict=False)
+
+        if not subnet.is_private:
+            print("[-] Only private networks are allowed.")
+            return []
+
+        if subnet.num_addresses > 256:
+            print("[-] Network too large. Maximum: /24.")
+            return []
+
+    except ValueError:
+        print("[-] Invalid network.")
+        return []
+
+    if not authorize(network):
+        return []
+
+    print(f"\n[+] Discovering devices on {network}")
+
+    devices = []
+
+    def check_host(host):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                for port in (80, 443, 22):
+                    if s.connect_ex((str(host), port)) == 0:
+                        return str(host)
+        except OSError:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        for result in executor.map(check_host, subnet.hosts()):
+            if result and result not in devices:
+                devices.append(result)
+                print("[+] Device responding:", result)
+
+    print(f"\n[+] Found {len(devices)} responding devices.")
+    return devices
+
+
+def dns_lookup(domain):
+    try:
+        print("\n[+] DNS information for:", domain)
+
+        results = socket.getaddrinfo(domain, None)
+
+        addresses = sorted(set(item[4][0] for item in results))
+
+        for address in addresses:
+            print("[DNS]", address)
+
+        return addresses
+
+    except socket.gaierror:
+        print("[-] DNS lookup failed.")
+        return []
+
+
+def http_check(domain):
+    if not domain.startswith(("http://", "https://")):
+        domain = "https://" + domain
+
+    print("\n[+] HTTP security inspection:", domain)
+
+    result = {
+        "url": domain,
+        "status": None,
+        "headers": {},
+        "findings": []
+    }
+
+    try:
+        request = urllib.request.Request(
+            domain,
+            headers={"User-Agent": "Sentinel-Ethical-Scanner/1.0"}
+        )
+
+        context = ssl.create_default_context()
+
+        try:
+            response = urllib.request.urlopen(
+                request, timeout=5, context=context
+            )
+        except urllib.error.HTTPError as error:
+            response = error
+
+        result["status"] = response.status
+        headers = response.headers
+
+        print("[HTTP] Status:", response.status)
+
+        security_headers = {
+            "Strict-Transport-Security":
+                "HSTS header missing",
+            "Content-Security-Policy":
+                "CSP header missing",
+            "X-Content-Type-Options":
+                "X-Content-Type-Options missing",
+            "X-Frame-Options":
+                "X-Frame-Options missing",
+            "Referrer-Policy":
+                "Referrer-Policy missing"
+        }
+
+        for header, warning in security_headers.items():
+            value = headers.get(header)
+
+            if value:
+                print(f"[OK] {header}: {value}")
+                result["headers"][header] = value
+            else:
+                print(f"[!] {warning}")
+                result["findings"].append(warning)
+
+        server = headers.get("Server")
+
+        if server:
+            print("[INFO] Server:", server)
+            result["headers"]["Server"] = server
+
+        if domain.startswith("http://"):
+            result["findings"].append(
+                "Website uses unencrypted HTTP"
+            )
+            print("[!] Website is not using HTTPS.")
+
+        response.close()
+
+    except Exception as error:
+        print("[-] HTTP inspection failed:", error)
+        result["error"] = str(error)
+
+    return result
+
+
+def service_info(ip, port):
+    print(f"\n[+] Checking service {ip}:{port}")
+
+    try:
+        with socket.create_connection(
+            (ip, port), timeout=TIMEOUT
+        ) as s:
+
+            s.settimeout(1)
+
+            try:
+                data = s.recv(512)
+                print("[BANNER]", data.decode(
+                    errors="replace"
+                ).strip())
+            except socket.timeout:
+                print("[INFO] No banner received.")
+
+    except OSError as error:
+        print("[-] Connection failed:", error)
+
+
+def save_report(data):
+    filename = os.path.join(
+        REPORT_DIR,
+        "report_" + datetime.datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        ) + ".json"
+    )
+
+    with open(filename, "w") as file:
+        json.dump(data, file, indent=4)
+
+    print("\n[+] Report saved:", filename)
+
+
+def main():
+    while True:
+        banner()
+
+        print("""
+[1] TCP Port Scanner
+[2] Local Network Scanner
+[3] DNS Lookup
+[4] Website Security Checker
+[5] Service Banner Check
+[6] Exit
+""")
+
+        choice = input("Sentinel > ").strip()
+
+        if choice == "1":
+            target = input("Target IP/domain: ").strip()
+
+            if not authorize(target):
+                continue
+
+            ip = resolve_host(target)
+
+            if ip:
+                ports = port_scan(ip)
+                save_report({
+                    "target": target,
+                    "ports": ports
+                })
+
+        elif choice == "2":
+            network = input(
+                "Private network (example 192.168.1.0/24): "
+            ).strip()
+
+            devices = network_scan(network)
+            save_report({"devices": devices})
+
+        elif choice == "3":
+            domain = input("Domain: ").strip()
+
+            if authorize(domain):
+                addresses = dns_lookup(domain)
+                save_report({
+                    "domain": domain,
+                    "addresses": addresses
+                })
+
+        elif choice == "4":
+            domain = input("Website URL: ").strip()
+
+            if authorize(domain):
+                result = http_check(domain)
+                save_report(result)
+
+        elif choice == "5":
+            ip = input("Target IP: ").strip()
+
+            if not authorize(ip):
+                continue
+
+            try:
+                ip = str(ipaddress.ip_address(ip))
+                port = int(input("Port: "))
+
+                if not 1 <= port <= 65535:
+                    raise ValueError
+
+                service_info(ip, port)
+
+            except ValueError:
+                print("[-] Invalid IP or port.")
+
+        elif choice == "6":
+            print("Exiting Sentinel. Stay ethical!")
+            break
+
+        else:
+            print("[-] Invalid option.")
+
+        input("\nPress Enter to continue...")
+
+
+if __name__ == "__main__":
+    main()
